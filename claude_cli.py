@@ -1279,7 +1279,7 @@ def repl():
 # Long-lived process that speaks the pi RPC wire protocol over stdin/stdout so the
 # Harness Remote bridge (and thus the phone) can drive this harness. Same records as
 # bridge/bionic-driver.mjs: one JSON object per line, nothing else on stdout.
-#   stdin  : prompt / abort / extension_ui_response / set_thinking_level
+#   stdin  : prompt / abort / extension_ui_response / set_thinking_level / set_model
 #   stdout : agent_start, turn_start, message_update, tool_execution_*, agent_settled,
 #            extension_ui_request, response, note
 # Everything else (progress, logs) goes to stderr.
@@ -1291,6 +1291,8 @@ RPC = {
     "ask": None,                          # {"event": threading.Event(), "result": {...}} while a question is open
     "q": __import__("queue").Queue(),     # prompt queue (one worker, FIFO)
     "shutdown": False,
+    "model_set": False,                   # set_model arrived: the saved session must not override it
+    "effort_set": False,                  # same for set_thinking_level
 }
 
 def rpc_out(rec):
@@ -1620,9 +1622,10 @@ def load_rpc_session(session_id):
         with open(p, "r", encoding="utf-8") as f:
             data = json.load(f)
         msgs = data.get("messages", [])
-        if data.get("model"):
+        if data.get("model") and not RPC["model_set"]:
             STATE["model"] = data["model"]
-        STATE["effort"] = data.get("effort", STATE.get("effort"))
+        if not RPC["effort_set"]:
+            STATE["effort"] = data.get("effort", STATE.get("effort"))
         return msgs
     except Exception:  # noqa: BLE001
         return []
@@ -1696,7 +1699,17 @@ def rpc_stdin_reader(session_id):
                 slot["event"].set()
         elif t == "set_thinking_level":
             STATE["effort"] = map_effort(msg.get("level"))
+            RPC["effort_set"] = True
             rpc_note("effort -> " + str(STATE["effort"] or "off"))
+        elif t == "set_model":
+            # Aliases (haiku/sonnet/opus/fable/fast/smart) or a full model id. Applies from the next turn.
+            name = resolve_model(str(msg.get("model") or ""))
+            if not name:
+                rpc_err("set_model", "set_model needs a model name")
+            else:
+                STATE["model"] = name
+                RPC["model_set"] = True
+                rpc_note("model -> " + name)
         else:
             rpc_err(str(t), "vibe mode does not support \"" + str(t) + "\"")
     # stdin closed: shut down the worker.
