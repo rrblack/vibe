@@ -92,6 +92,12 @@ On by default. It marks the tools plus system prefix and the growing conversatio
 
 `--rpc` speaks the pi-compatible RPC record protocol over stdin/stdout (`prompt`, `abort`, `extension_ui_request/response`, `set_thinking_level`). That is how [Harness Remote](https://github.com/rrblack/harness-remote) runs vibe from the phone: the app sees streamed thinking, each tool call with its output, permission cards you answer from the phone, and the effort picker applies to the next turn. The bridge launches it with `-m opus -e high -t 65536` by default; see the harness's README, section *Vibe (Claude API)*.
 
+## Bionic skill (SKILL.md)
+
+`SKILL.md` at the repo root is a Bionic/Claude skill that teaches a local agent how to delegate work to this harness. It covers the one-shot JSON path (`py claude_cli.py --json -T -m haiku "task"`; `-y` only for change-making jobs, scoped with `-d`), the live relay protocol for long jobs (poll the work log before checking for DONE, so progress is always relayed, not just the final answer), and when to use vibe vs the agent's own tools. Install by copying it into a skills folder (e.g. `~/.lmstudio/skills/vibe/`).
+
+The visible, live delegation path used by the phone app and the bridge is `delegate.mjs` in [harness-remote](https://github.com/rrblack/harness-remote) (README section *Delegating to Claude from Bionic*).
+
 ## Windows shortcut
 
 `vibe.cmd` runs the harness from any folder with your machine's path. Adjust the path if the folder moves.
