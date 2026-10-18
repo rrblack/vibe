@@ -1,0 +1,10 @@
+# secrets + local session state (never commit)
+anthropic_key.txt
+.claude_session.json
+workspaces.json
+.vibe_history
+vibe_trace.log
+vibe_result.json
+vibe_run.err
+vibe_run.pid
+.run_offset
