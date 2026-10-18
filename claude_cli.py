@@ -15,7 +15,7 @@ Flags:
     -m/--model NAME     model to use (default claude-haiku-5-5); aliases: haiku, sonnet, opus, fable, fast, smart
     -d/--cwd PATH       working directory the tools operate in
     -w/--workspace NAME switch to a saved workspace (folder alias from workspaces.json)
-    -e/--effort LEVEL   thinking effort: low | medium | high (adaptive thinking, 5.5-line models)
+    -e/--effort LEVEL   thinking effort: low | medium | high (adaptive thinking, summarized thinking shown, 5.5-line models)
     -t/--max-tokens N   max output tokens per call (default 8192)
     -y/--yolo           skip confirmation prompts (auto-approve tools)
     -f/--fresh          start a brand-new session (do not resume the saved one)
@@ -106,6 +106,68 @@ def list_models_api(key: str):
 
 
 _TRACE_LOG_HANDLE = None
+_TRACE_AT_BOL = True  # last thing written to the trace log ended a line
+
+
+# ---------------- thinking config (single source of truth) ----------------
+# Every Messages API payload (one-shot agent_loop + its salvage call, rpc run_one_rpc + its
+# salvage call) goes through apply_thinking(). Verified against the live API on 2026-10-18 for
+# claude-opus-5-5, claude-sonnet-5-5, claude-haiku-5-5 and claude-fable-5-1:
+#   * thinking {"type": "enabled", "budget_tokens": N}  -> HTTP 400 ("thinking.type.enabled is not
+#     supported for this model. Use thinking.type.adaptive and output_config.effort").
+#   * thinking {"type": "adaptive", "budget_tokens": N} -> HTTP 400 (extra inputs not permitted).
+#     So these models have NO token budget knob: depth is set only by output_config.effort.
+#     Our levels map 1:1:  low -> "low", medium -> "medium", high -> "high"  (low < medium < high;
+#     the API also accepts "xhigh" and "max", which we do not send by default).
+#   * thinking.display is "summarized" | "omitted", and the DEFAULT is "omitted": the model really
+#     thinks (usage.output_tokens_details.thinking_tokens > 0) but the stream carries one EMPTY
+#     thinking_delta plus a signature. That is why no thinking ever reached the phone/PC UI.
+#     "summarized" streams readable thinking text, so we always request it.
+#   * Adaptive means the model may still skip thinking on a trivial prompt (sonnet/fable did for a
+#     short puzzle even at high effort); real reasoning work at medium/high does think.
+# Effort off/None -> no thinking config at all (unchanged).
+THINKING_DISPLAY = os.environ.get("VIBE_THINKING_DISPLAY", "summarized")  # or "omitted"
+
+
+def apply_thinking(payload: dict) -> dict:
+    """Add the thinking config for STATE['effort'] (low|medium|high) to a Messages payload in place.
+    No effort -> nothing is added."""
+    eff = STATE.get("effort")
+    if eff:
+        payload["thinking"] = {"type": "adaptive", "display": THINKING_DISPLAY}
+        payload["output_config"] = {"effort": eff}
+    return payload
+
+
+def _trace_record(rec: dict):
+    """One JSON record on its own line in the trace log (thinking deltas etc.). Trace log only."""
+    global _TRACE_AT_BOL
+    if _TRACE_LOG_HANDLE is None:
+        return
+    try:
+        _TRACE_LOG_HANDLE.write(("" if _TRACE_AT_BOL else "\n") + json.dumps(rec, ensure_ascii=False) + "\n")
+        _TRACE_LOG_HANDLE.flush()
+        _TRACE_AT_BOL = True
+    except Exception:  # noqa: BLE001
+        pass
+
+
+THINKING_SECTION_CAP = 4000
+
+
+def thinking_section() -> str:
+    """Delimited 'Thinking:' block for the end of a one-shot run ('' when the model did not think).
+    Keeps the LAST THINKING_SECTION_CAP chars (the conclusions) and says so when it cuts."""
+    full = "".join(STATE.get("thinking_log") or []).strip()
+    if not full:
+        return ""
+    body = full
+    note = ""
+    if len(full) > THINKING_SECTION_CAP:
+        body = full[-THINKING_SECTION_CAP:]
+        note = f"[truncated: showing the last {THINKING_SECTION_CAP} of {len(full)} chars]\n"
+    return ("===== Thinking: (summarized by the API) =====\n" + note + body +
+            "\n===== end Thinking =====")
 
 
 def _emit(msg: str, end: str = "\n"):
@@ -119,9 +181,12 @@ def _emit(msg: str, end: str = "\n"):
     target.write(msg + end)
     target.flush()
     if _TRACE_LOG_HANDLE is not None:
+        global _TRACE_AT_BOL
         try:
             _TRACE_LOG_HANDLE.write(msg + end)
             _TRACE_LOG_HANDLE.flush()
+            if msg + end:
+                _TRACE_AT_BOL = (msg + end).endswith("\n")
         except Exception:  # noqa: BLE001
             pass
 
@@ -172,6 +237,8 @@ def call_model(key: str, payload: dict, quiet: bool = False):
                 elif btype == "server_tool_use":
                     block["_input"] = ""
                     _emit(f"\n  [server-tool] {block.get('name')} ...")
+                elif btype == "thinking":
+                    _emit("\n  [thinking] ...")
             elif t == "content_block_delta":
                 idx = ev["index"]
                 delta = ev.get("delta", {})
@@ -183,8 +250,12 @@ def call_model(key: str, payload: dict, quiet: bool = False):
                     blocks.setdefault(idx, {"type": "text", "text": ""})
                     blocks[idx]["text"] = blocks[idx].get("text", "") + txt
                 elif dt == "thinking_delta":
+                    th = delta.get("thinking", "")
+                    if th:
+                        _trace_record({"type": "thinking_delta", "delta": th})
+                        STATE.setdefault("thinking_log", []).append(th)
                     blocks.setdefault(idx, {"type": "thinking", "thinking": ""})
-                    blocks[idx]["thinking"] = blocks[idx].get("thinking", "") + delta.get("thinking", "")
+                    blocks[idx]["thinking"] = blocks[idx].get("thinking", "") + th
                 elif dt == "signature_delta":
                     blocks[idx]["signature"] = blocks[idx].get("signature", "") + delta.get("signature", "")
                 elif dt == "input_json_delta":
@@ -336,9 +407,7 @@ def agent_loop(task, *, system, model, tools, messages, max_steps=MAX_STEPS,
         steps += 1
         payload = {"model": model, "max_tokens": STATE["max_tokens"],
                    "system": system, "tools": tools, "messages": messages}
-        if STATE.get("effort"):
-            payload["thinking"] = {"type": "adaptive"}
-            payload["output_config"] = {"effort": STATE["effort"]}
+        apply_thinking(payload)
         _apply_cache_control(payload)
         content, stop_reason, usage = call_model(key, payload, quiet=quiet)
         _add_cost(cost, usage)
@@ -396,9 +465,7 @@ def agent_loop(task, *, system, model, tools, messages, max_steps=MAX_STEPS,
         payload = {"model": model, "max_tokens": STATE.get("max_tokens", 8192),
                    "system": system,
                    "messages": messages + [{"role": "user", "content": salvage}]}
-        if STATE.get("effort"):
-            payload["thinking"] = {"type": "adaptive"}
-            payload["output_config"] = {"effort": STATE["effort"]}
+        apply_thinking(payload)
         _apply_cache_control(payload)
         content, _stop, usage = call_model(key, payload, quiet=quiet)
         _add_cost(cost, usage)
@@ -559,6 +626,7 @@ def system_prompt() -> str:
 
 # ---------------- the agent loop ----------------
 def run_turn(task: str):
+    STATE["thinking_log"] = []
     agent_loop(task, system=system_prompt(), model=STATE["model"],
                tools=main_tools(), messages=STATE["messages"],
                cost=STATE["cost"], quiet=False,
@@ -1543,9 +1611,7 @@ def run_one_rpc(messages, msg, cost):
             return
         payload = {"model": model, "max_tokens": STATE["max_tokens"],
                    "system": system, "tools": tools, "messages": messages}
-        if STATE.get("effort"):
-            payload["thinking"] = {"type": "adaptive"}
-            payload["output_config"] = {"effort": STATE["effort"]}
+        apply_thinking(payload)
         _apply_cache_control(payload)
         blocks, stop_reason, usage, aborted = call_model_rpc(key, payload, rpc_out)
         _add_cost(cost, usage)
@@ -1602,6 +1668,7 @@ def run_one_rpc(messages, msg, cost):
                        "answer now: what you completed, what you found, and what remains.")
             payload = {"model": model, "max_tokens": STATE["max_tokens"], "system": system,
                        "messages": messages + [{"role": "user", "content": salvage}]}
+            apply_thinking(payload)
             _apply_cache_control(payload)
             blocks, _sr, usage, _ab = call_model_rpc(key, payload, rpc_out)
             _add_cost(usage, usage) if False else _add_cost(cost, usage)
@@ -1843,6 +1910,7 @@ def main():
         if not oneshot:
             raise SystemExit("--json needs a task. e.g.  py claude_cli.py --json -m sonnet \"summarize X\"")
         STATE["quiet"] = True
+        STATE["thinking_log"] = []
         answer = agent_loop(oneshot, system=system_prompt(), model=STATE["model"],
                             tools=main_tools(), messages=[], cost=STATE["cost"], quiet=True,
                             max_steps=STATE.get("max_steps", MAX_STEPS))
@@ -1850,7 +1918,9 @@ def main():
                                   "input_tokens": STATE["cost"]["in"],
                                   "output_tokens": STATE["cost"]["out"],
                                   "cache_write_tokens": STATE["cost"].get("cache_write", 0),
-                                  "cache_read_tokens": STATE["cost"].get("cache_read", 0)},
+                                  "cache_read_tokens": STATE["cost"].get("cache_read", 0),
+                                  # only present when the model thought (capped like the text section)
+                                  **({"thinking": thinking_section()} if thinking_section() else {})},
                                  ensure_ascii=False)
         print(result_line)
         try:
@@ -1869,6 +1939,9 @@ def main():
     if oneshot:
         try:
             run_turn(oneshot)
+            sec = thinking_section()
+            if sec:
+                print(sec, flush=True)
         finally:
             save_session()
             c = STATE["cost"]
