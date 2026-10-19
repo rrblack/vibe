@@ -19,8 +19,9 @@ Flags:
     -t/--max-tokens N   max output tokens per call (default 8192)
     -y/--yolo           skip confirmation prompts (auto-approve tools)
     -f/--fresh          start a brand-new session (do not resume the saved one)
-    --json              one-shot JSON mode: isolated run, no session, quiet, prints
-                        {"model","answer","input_tokens","output_tokens"} (for orchestration)
+    --json              RETIRED: blocked by default (refuses, exit 2) because it ran Claude
+                        invisibly. Use delegate.mjs (Remote Access App\\DELEGATE.md).
+                        VIBE_ALLOW_JSON=1 re-enables it for debugging only.
     --trace/-T          with --json, also emit the work log (tool calls, results, subagents,
                         narration) to stderr so stdout stays pure JSON
     --max-steps N       optional cap on agent steps per task (default 0 = unlimited);
@@ -191,22 +192,27 @@ def _emit(msg: str, end: str = "\n"):
             pass
 
 
-def call_model(key: str, payload: dict, quiet: bool = False):
-    """Stream a Messages API call. Returns (content_blocks, stop_reason, usage)."""
-    payload = dict(payload)
-    payload["stream"] = True
-    req = urllib.request.Request(
-        API_BASE + "/v1/messages",
-        data=json.dumps(payload).encode("utf-8"),
-        headers={"x-api-key": key, "anthropic-version": "2023-06-01",
-                 "content-type": "application/json", "accept": "text/event-stream"},
-        method="POST",
-    )
-    blocks = {}
-    order = []
-    stop_reason = None
-    usage = {"input_tokens": 0, "output_tokens": 0, "cache_write": 0, "cache_read": 0}
+# Transient API failures are retried, but only while NO stream data has arrived yet (a retry after
+# the first SSE event would duplicate already-emitted text/tool calls). Deterministic errors
+# (400/401/403/404 ...) fail fast.
+RETRYABLE_HTTP = {408, 425, 429, 500, 502, 503, 504, 529}
+API_MAX_ATTEMPTS = 3
+API_BACKOFF_S = (5, 10)  # sleep before attempt 2, attempt 3
 
+
+def _http_error_detail(e) -> str:
+    """Short API error body for the work log (best effort, never raises)."""
+    try:
+        body = e.read().decode("utf-8", "replace").strip()
+    except Exception:  # noqa: BLE001
+        return ""
+    return body[:500]
+
+
+def _read_message_stream(req, blocks: dict, order: list, usage: dict, seen: dict):
+    """Run one streaming request and fold its SSE events into blocks/order/usage (in place).
+    Sets seen['event'] = True on the first parsed event. Returns stop_reason."""
+    stop_reason = None
     with urllib.request.urlopen(req, timeout=300) as resp:
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
@@ -219,6 +225,7 @@ def call_model(key: str, payload: dict, quiet: bool = False):
                 ev = json.loads(data)
             except json.JSONDecodeError:
                 continue
+            seen["event"] = True  # stream started: a failure from here on is not retried
             t = ev.get("type")
             if t == "message_start":
                 u = ev.get("message", {}).get("usage", {})
@@ -272,6 +279,41 @@ def call_model(key: str, payload: dict, quiet: bool = False):
                     usage["cache_read"] = u["cache_read_input_tokens"]
             elif t == "error":
                 raise SystemExit("Model error: " + json.dumps(ev))
+    return stop_reason
+
+
+def call_model(key: str, payload: dict, quiet: bool = False):
+    """Stream a Messages API call. Returns (content_blocks, stop_reason, usage)."""
+    payload = dict(payload)
+    payload["stream"] = True
+    req = urllib.request.Request(
+        API_BASE + "/v1/messages",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01",
+                 "content-type": "application/json", "accept": "text/event-stream"},
+        method="POST",
+    )
+    for attempt in range(1, API_MAX_ATTEMPTS + 1):
+        blocks = {}
+        order = []
+        usage = {"input_tokens": 0, "output_tokens": 0, "cache_write": 0, "cache_read": 0}
+        seen = {"event": False}
+        try:
+            stop_reason = _read_message_stream(req, blocks, order, usage, seen)
+            break
+        except urllib.error.HTTPError as e:
+            if seen["event"] or e.code not in RETRYABLE_HTTP or attempt == API_MAX_ATTEMPTS:
+                detail = _http_error_detail(e)
+                _emit(f"\n  [error] API error {e.code}" + (f": {detail}" if detail else ""))
+                raise
+            reason = f"API error {e.code}"
+        except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+            if seen["event"] or attempt == API_MAX_ATTEMPTS:
+                raise
+            reason = f"connection error ({type(e).__name__}: {e})"
+        delay = API_BACKOFF_S[min(attempt - 1, len(API_BACKOFF_S) - 1)]
+        _emit(f"\n  [warn] {reason} (attempt {attempt}/{API_MAX_ATTEMPTS}), retrying in {delay}s")
+        time.sleep(delay)
 
     content = []
     for idx in order:
@@ -1807,6 +1849,40 @@ def rpc_main(session_id):
 
 
 # ---------------- entrypoint ----------------
+DELEGATE_DIR = r"C:\Users\Kyle\Documents\Claude Projects\Remote Access App"
+
+JSON_REFUSAL = f"""
+==================================================================================
+ REFUSED: claude_cli.py --json is retired (blocked by the harness).
+==================================================================================
+ Invisible one-shots ran Claude outside any session: nothing showed in the phone
+ app (Harness Remote) or in the Bionic chat, and a crash mid-run lost the result
+ (vibe_result.json is only written at the very end).
+
+ Run Claude as a LIVE session through delegate.mjs instead:
+
+   cd "{DELEGATE_DIR}"
+   node delegate.mjs start --cwd "<folder>" --prompt-file "<prompt.txt>" \\
+        [--model haiku|sonnet|opus|fable] [--effort low|medium|high] --title "<t>"
+       -> SESSION <id>
+   node delegate.mjs wait <id>       blocks up to 100 s, prints what is new
+       exit 0 DONE | 3 RUNNING (call wait again) | 4 KILLED (idle 300 s)
+            | 5 WAITING (question, answer in the app) | 1 error
+       keep calling wait while it exits 3 (there is NO total time cap)
+   node delegate.mjs result <id>     final reply of the last turn
+   node delegate.mjs send <id> --prompt "<follow-up>"   next turn, same session
+   node delegate.mjs stop <id>
+
+ Full protocol: {DELEGATE_DIR}\\DELEGATE.md
+
+ Short questions work the same way: start with --model haiku, then wait + result.
+
+ Debugging escape hatch only (still invisible, do not use for real work):
+   set VIBE_ALLOW_JSON=1   (bash: VIBE_ALLOW_JSON=1 py claude_cli.py --json ...)
+==================================================================================
+"""
+
+
 def parse_args(argv):
     opts = {"model": DEFAULT_MODEL, "yolo": False, "cwd": os.getcwd(),
             "max_tokens": 8192, "web_search": True, "fresh": False, "json": False,
@@ -1889,6 +1965,11 @@ def main():
         # session load/save; the conversation persists under --session-id.
         rpc_main(opts.get("session_id"))
         return
+
+    if opts.get("json") and os.environ.get("VIBE_ALLOW_JSON") != "1":
+        sys.stderr.write(JSON_REFUSAL)
+        sys.stderr.flush()
+        sys.exit(2)
 
     if STATE.get("trace"):
         global _TRACE_LOG_HANDLE

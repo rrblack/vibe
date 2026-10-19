@@ -55,8 +55,8 @@ Flags:
 | `-y/--yolo` | skip confirmation prompts (auto-approve tools) |
 | `-f/--fresh` | start a brand-new session, do not resume the saved one |
 | `--max-steps N` | optional cap on agent steps per task (default 0 = unlimited) |
-| `--json` | one-shot JSON mode: isolated run, quiet, prints `{"model","answer","input_tokens","output_tokens"}` |
-| `--trace/-T` | with `--json`, also emit the work log (tool calls, results, subagents) to stderr |
+| `--json` | **retired, blocked by default**: refuses to run (exit 2) and points at `delegate.mjs` (the live bridge session path). `VIBE_ALLOW_JSON=1` re-enables it for debugging only (still invisible) |
+| `--trace/-T` | with `--json` (debug override only), also emit the work log (tool calls, results, subagents) to stderr |
 | `--trace-log PATH` | append the work log to a file another terminal can watch live |
 | `--no-cache` | disable prompt caching (on by default) |
 | `--no-search` | disable the web search tool |
@@ -84,9 +84,13 @@ Tools that change anything ask for confirmation first, unless you pass `-y` or f
 
 On by default. It marks the tools plus system prefix and the growing conversation with ephemeral `cache_control` breakpoints, so multi-step jobs and repeat runs bill the shared prefix as cheap cache reads instead of fresh input tokens. `/cache off` or `--no-cache` disables it. `/cost` shows the running totals for the session, including cache writes and reads.
 
-## Orchestration (JSON mode)
+## Orchestration (retired JSON mode -> live bridge sessions)
 
-`--json` keeps stdout pure JSON (`{"model","answer","input_tokens","output_tokens"}`) for scripts, and `--trace` adds the full work log to stderr. `--trace-log PATH` tees the log to a file you can `tail -f` from another terminal.
+Delegated runs go through the Harness Bridge as normal vibe sessions (`--rpc`), driven by `delegate.mjs` in the Remote Access App folder (`start` / `wait` / `result` / `send` / `stop`, see its `DELEGATE.md`). That way every run is visible live in the phone app and in the Bionic chat, and a crash never loses an invisible result. The old `--json` one-shot ran Claude outside any session, so the harness now refuses it with a pointer to `delegate.mjs`.
+
+Debugging escape hatch: `VIBE_ALLOW_JSON=1` re-enables `--json` (pure JSON on stdout, `--trace` work log on stderr). It is still invisible; never use it for real work. `--trace-log PATH` tees the work log to a file you can `tail -f`.
+
+Transient Anthropic API errors (HTTP 408/425/429/500/502/503/504/529, dropped connections) are retried up to 3 attempts with 5 s / 10 s backoff, as long as no stream data has arrived yet; deterministic errors (400/401/403/404) fail fast and the API error body is written to the work log.
 
 ## RPC mode (harness-remote)
 
@@ -94,7 +98,7 @@ On by default. It marks the tools plus system prefix and the growing conversatio
 
 ## Bionic skill (SKILL.md)
 
-`SKILL.md` at the repo root is a Bionic/Claude skill that teaches a local agent how to delegate work to this harness. It covers the one-shot JSON path (`py claude_cli.py --json -T -m haiku "task"`; `-y` only for change-making jobs, scoped with `-d`), the live relay protocol for long jobs (poll the work log before checking for DONE, so progress is always relayed, not just the final answer), and when to use vibe vs the agent's own tools. Install by copying it into a skills folder (e.g. `~/.lmstudio/skills/vibe/`).
+`SKILL.md` at the repo root is a Bionic/Claude skill that teaches a local agent how to delegate work to Claude. It teaches **only** the live `delegate.mjs` session path (start with `--cwd` / `--prompt-file` / `--model` / `--effort`, keep calling `wait` while it exits 3 and relay progress, then `result`; `send` for follow-ups, `stop`), model guidance (haiku quick, sonnet normal, opus + high for hard jobs), the 300 s idle watchdog with no total cap, and that `--json` is blocked by the harness. Install by copying it into a skills folder (e.g. `~/.lmstudio/skills/vibe/`); keep both copies identical.
 
 The visible, live delegation path used by the phone app and the bridge is `delegate.mjs` in [harness-remote](https://github.com/rrblack/harness-remote) (README section *Delegating to Claude from Bionic*).
 
