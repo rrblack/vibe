@@ -19,7 +19,11 @@ which runs Claude as a normal vibe session on the Harness Bridge
 1. Write the task into a prompt file (it must carry all context, expected
    output and constraints; Claude has no chat with Kyle except through the app).
 
-2. Start the session:
+2. Open the live pane once (Bionic desktop): `open_url_in_app_browser`
+   with `http://127.0.0.1:8787`. Kyle watches Claude there, live. That pane
+   is the progress view; do not poll `wait` in a tight loop to "watch".
+
+3. Start the session:
 
 ```
 cd "C:\Users\Kyle\Documents\Claude Projects\Remote Access App"
@@ -29,24 +33,24 @@ node delegate.mjs start --cwd "<folder Claude works in>" --prompt-file "<prompt.
 
    (`--prompt "<text>"` works instead of `--prompt-file` for a short task.)
 
-3. Wait, and keep waiting:
+4. Wait, and keep waiting:
 
 ```
 node delegate.mjs wait <id>          # blocks up to 100 s, prints what is new
    exit 0 DONE | 3 RUNNING (call wait again) | 4 KILLED (idle) | 5 WAITING (question, answer in the app) | 1 error
 ```
 
-   Keep calling `wait` while it exits 3. Between waits, send Kyle a one-line
-   progress note from what the wait printed. Stop waiting only on 0, 4 or 5
-   (or 1 = error, report it).
+   `wait` has one job: detect the end of the turn. Call it a few times at
+   most per turn, not as a watcher (the live pane or the phone app is the
+   watcher). Stop waiting only on 0, 4 or 5 (or 1 = error, report it).
 
-4. Collect the answer:
+5. Collect the answer:
 
 ```
 node delegate.mjs result <id>        # final reply of the last turn
 ```
 
-5. Follow-ups and stopping:
+6. Follow-ups and stopping:
 
 ```
 node delegate.mjs send <id> --prompt "<follow-up>"   # next turn, same session (keeps context)
