@@ -71,6 +71,7 @@ from datetime import datetime
 API_BASE = "https://api.anthropic.com"
 DEFAULT_MODEL = "claude-haiku-5-5"
 MAX_STEPS = 0  # 0 = unlimited (no step budget); pass --max-steps N to cap a job
+EMPTY_TURN_RETRIES = 2  # retries when a response is thinking-only (no visible output)
 
 # Short aliases for common models (family -> current 5.5 line). Full IDs work too.
 MODEL_ALIASES = {
@@ -566,6 +567,19 @@ def agent_loop(task, *, system, model, tools, messages, max_steps=MAX_STEPS,
         _add_cost(cost, usage)
         messages.append({"role": "assistant", "content": content})
         tool_uses = [b for b in content if b.get("type") == "tool_use"]
+        if not tool_uses and not _visible_text(content):
+            # Thinking-only response: nothing visible, nothing to execute. Recover
+            # by re-asking instead of returning an empty answer silently.
+            if not recover_empty_turn(
+                    lambda k, p: (*call_model(k, p, quiet=quiet), False),
+                    lambda t: _emit(t), key, payload, messages, cost):
+                _emit("\n  [error] model kept returning thinking-only responses "
+                      "(retried %d times); no visible output" % EMPTY_TURN_RETRIES)
+                return ""
+            content = messages[-1]["content"]
+            tool_uses = [b for b in content if b.get("type") == "tool_use"]
+            if not tool_uses:
+                return "".join(b.get("text", "") for b in content if b.get("type") == "text")
         if not tool_uses:
             # No tool call this round. Covers normal completion and a text-only
             # response cut off by the token cap (nothing left to execute).
@@ -1718,6 +1732,11 @@ def call_model_rpc(key, payload, emit):
                     raise SystemExit("Model error: " + json.dumps(ev))
     except SystemExit:
         raise
+    except urllib.error.HTTPError as e:
+        if aborted:
+            return content_finalize(blocks, order), stop_reason, usage, True
+        detail = _http_error_detail(e)[:300]
+        raise SystemExit(f"API error {e.code}" + (f": {detail}" if detail else ""))
     except Exception as e:  # noqa: BLE001
         if aborted:
             return content_finalize(blocks, order), stop_reason, usage, True
@@ -1756,6 +1775,52 @@ def rpc_user_content(text, images):
         content.append({"type": "text", "text": "(empty message)"})
     return content
 
+def _visible_text(blocks) -> str:
+    return "".join(b.get("text", "") for b in blocks if b.get("type") == "text").strip()
+
+
+def recover_empty_turn(call_fn, emit_fn, key, payload, messages, cost,
+                       aborted_check=None, max_retries=EMPTY_TURN_RETRIES):
+    """Recover from a thinking-only response: a turn that carries a thinking block
+    but no text and no tool call would, if returned, end the session silently -
+    nothing shows in the app and the job just stops (observed on the 5.5 line with
+    adaptive thinking). messages[-1] is the thinking-only assistant message.
+    The replay never includes that message: the API rejects a conversation that
+    contains a thinking-only assistant message with HTTP 400. Each attempt resends
+    the conversation without it (attempt 1 as is, later attempts with a nudge user
+    message appended); a failed request is reported and the next attempt runs. On
+    success, messages is rewritten in place to that conversation plus the nudge
+    (when used) and the new assistant reply. Returns True on success, False when
+    retries are exhausted or the run was aborted."""
+    nudge = ("Your previous response was empty (thinking only). Continue the task "
+             "now and produce visible output.")
+    base = [dict(m) for m in messages[:-1]]  # drop the thinking-only assistant tail
+    for attempt in range(1, max_retries + 1):
+        if aborted_check is not None and aborted_check():
+            return False
+        emit_fn("\n  [warn] thinking-only response (no visible output); retry %d/%d"
+                % (attempt, max_retries))
+        nudged = attempt > 1
+        req_payload = dict(payload)
+        req_payload["messages"] = base + (
+            [{"role": "user", "content": nudge}] if nudged else [])
+        try:
+            blocks, _stop, usage, aborted = call_fn(key, req_payload)
+        except (SystemExit, urllib.error.HTTPError) as e:
+            emit_fn("\n  [warn] retry %d/%d failed: %s" % (attempt, max_retries, str(e)[:300]))
+            continue
+        _add_cost(cost, usage)
+        if aborted:
+            return False
+        if any(b.get("type") == "tool_use" for b in blocks) or _visible_text(blocks):
+            messages[:] = base
+            if nudged:
+                messages.append({"role": "user", "content": nudge})
+            messages.append({"role": "assistant", "content": blocks})
+            return True
+    return False
+
+
 def run_one_rpc(messages, msg, cost):
     """Run the agent loop for a single prompt. Emits records. Returns None."""
     text = str(msg.get("message", ""))
@@ -1785,6 +1850,23 @@ def run_one_rpc(messages, msg, cost):
         tool_uses = [b for b in blocks if b.get("type") == "tool_use"]
         if aborted:
             return
+        if not tool_uses and not _visible_text(blocks):
+            # Thinking-only response: nothing visible, nothing to execute. A plain
+            # return here ends the turn silently - the job stops with no output
+            # (observed on the 5.5 line with adaptive thinking). Recover by
+            # re-asking; fail loudly if the model keeps doing it.
+            if not recover_empty_turn(
+                    lambda k, p: call_model_rpc(k, p, rpc_out),
+                    lambda t: rpc_note(t), key, payload, messages, cost,
+                    aborted_check=lambda: RPC["abort"].is_set()):
+                rpc_err("run", "model kept returning thinking-only responses "
+                               "(retried %d times); turn aborted with no visible output"
+                        % EMPTY_TURN_RETRIES)
+                return
+            blocks = messages[-1]["content"]
+            tool_uses = [b for b in blocks if b.get("type") == "tool_use"]
+            if not tool_uses:
+                return
         if not tool_uses:
             return
         results = []
