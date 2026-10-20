@@ -60,6 +60,7 @@ Slash commands:
 """
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -361,6 +362,13 @@ def expand_path(p: str) -> str:
 GIT_BASH = (r"C:\Program Files\Git\usr\bin\bash.exe", r"C:\Program Files\Git\bin\bash.exe")
 SHELL_PROBE = "HR_SHELL_PROBE"
 
+# Appended to every run_shell description: models that write files through a heredoc can emit a
+# real CR/LF where they meant the characters \r\n, which corrupts the file (SyntaxError).
+SHELL_FILE_NOTE = " For creating or editing files use write_file, not heredoc/echo."
+SHELL_HINT_RE = re.compile(r"unterminated string literal|SyntaxError")
+SHELL_HINT = ("\n[vibe hint: the quoted content likely picked up raw CR/LF inside a string literal. "
+              "Do not retry the heredoc; recreate the file with the write_file tool.]")
+
 SHELL_DESCRIPTIONS = {
     "bash": ("Run a shell command with Git Bash (Windows); return exit_code, stdout, stderr. "
              "Write POSIX/bash syntax (ls, cat, head, grep, pwd, &&, $VAR, 2>&1). "
@@ -432,8 +440,15 @@ def with_shell_description(tools):
     """Copy of tools whose run_shell description names the active shell and its syntax."""
     if not any(t.get("name") == "run_shell" for t in tools):
         return tools
-    desc = SHELL_DESCRIPTIONS[active_shell()]
+    desc = SHELL_DESCRIPTIONS[active_shell()] + SHELL_FILE_NOTE
     return [dict(t, description=desc) if t.get("name") == "run_shell" else t for t in tools]
+
+
+def with_shell_hint(code, err: str) -> str:
+    """stderr plus a write_file hint when a failed command looks like heredoc quoting damage."""
+    if code != 0 and SHELL_HINT_RE.search(err or ""):
+        return err + SHELL_HINT
+    return err
 
 
 def run_shell(command: str, cwd: str = None, timeout_s: int = 120):
@@ -444,7 +459,7 @@ def run_shell(command: str, cwd: str = None, timeout_s: int = 120):
     p = subprocess.run(args, shell=use_shell, cwd=cwd, stdin=subprocess.DEVNULL,
                        capture_output=True, text=True, errors="replace", timeout=timeout_s)
     return {"exit_code": p.returncode,
-            "stdout": p.stdout[-20000:], "stderr": p.stderr[-20000:]}
+            "stdout": p.stdout[-20000:], "stderr": with_shell_hint(p.returncode, p.stderr[-20000:])}
 
 
 def read_file(path: str, max_chars: int = 20000):
@@ -671,7 +686,8 @@ TOOL_IMPL = {
 TOOLS = [
     {"name": "run_shell",
      # Replaced per process by with_shell_description() with the active shell (bash / cmd / sh).
-     "description": "Run a shell command; return exit_code, stdout, stderr. For builds, tests, git, installs, etc.",
+     "description": "Run a shell command; return exit_code, stdout, stderr. For builds, tests, git, installs, etc."
+                    + SHELL_FILE_NOTE,
      "input_schema": {"type": "object", "properties": {
         "command": {"type": "string", "description": "The command line to run."},
         "cwd": {"type": "string", "description": "Optional working directory."},
@@ -759,7 +775,12 @@ def system_prompt() -> str:
         "and verify results. You can run shell commands, read/write files, list directories, "
         "and make HTTP requests. For large or parallelizable work, delegate a subtask to a "
         "focused subagent with spawn_subagent (roles: researcher, code_reviewer, general). "
-        f"Current working directory: {STATE.get('cwd') or os.getcwd()}. When finished, give a short summary."
+        f"Current working directory: {STATE.get('cwd') or os.getcwd()}. When finished, give a short summary. "
+        "File writing: to create or edit a file, ALWAYS use the write_file tool with the full content. "
+        "NEVER write multi-line file content through a shell heredoc (cat > f <<EOF), echo, or python -c; "
+        "heredocs corrupt escape sequences such as \\r\\n and cause SyntaxError. If a shell command fails "
+        "with 'unterminated string literal' or similar quoting damage, stop retrying the shell and recreate "
+        "the file with write_file."
     )
 
 
@@ -1589,7 +1610,7 @@ def interruptible_shell(command, cwd, timeout_s):
     code = -1 if (aborted or p.returncode is None) else p.returncode
     if aborted:
         err = (err + "\n[aborted by user]").strip()
-    return {"exit_code": code, "stdout": out, "stderr": err}
+    return {"exit_code": code, "stdout": out, "stderr": with_shell_hint(code, err)}
 
 def execute_tool(name, args):
     """Run one tool with RPC abort support. Returns (out_text, is_error)."""
