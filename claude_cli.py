@@ -71,7 +71,7 @@ from datetime import datetime
 API_BASE = "https://api.anthropic.com"
 DEFAULT_MODEL = "claude-haiku-5-5"
 MAX_STEPS = 0  # 0 = unlimited (no step budget); pass --max-steps N to cap a job
-EMPTY_TURN_RETRIES = 2  # retries when a response is thinking-only (no visible output)
+EMPTY_TURN_RETRIES = 8  # nudges when a response is thinking-only (no visible output); the run never hard-fails on this
 
 # Short aliases for common models (family -> current 5.5 line). Full IDs work too.
 MODEL_ALIASES = {
@@ -216,6 +216,18 @@ def _http_error_detail(e) -> str:
     return body[:500]
 
 
+class StaleSessionError(Exception):
+    """The API rejected a saved session because a thinking block's signature is bound
+    to a different conversation (the system prompt or tools list changed since the
+    block was made). Retrying the history cannot work; the fix is to drop the stale
+    history and continue with the current message only."""
+
+
+def _looks_stale_session(body: str) -> bool:
+    body = (body or "").lower()
+    return "signature" in body and ("thinking" in body or "conversation" in body)
+
+
 def _read_message_stream(req, blocks: dict, order: list, usage: dict, seen: dict):
     """Run one streaming request and fold its SSE events into blocks/order/usage (in place).
     Sets seen['event'] = True on the first parsed event. Returns stop_reason."""
@@ -312,6 +324,8 @@ def call_model(key: str, payload: dict, quiet: bool = False):
             if seen["event"] or e.code not in RETRYABLE_HTTP or attempt == API_MAX_ATTEMPTS:
                 detail = _http_error_detail(e)
                 _emit(f"\n  [error] API error {e.code}" + (f": {detail}" if detail else ""))
+                if _looks_stale_session(detail):
+                    raise StaleSessionError(detail) from e
                 raise
             reason = f"API error {e.code}"
         except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
@@ -389,6 +403,19 @@ def _git_bash():
     return next((p for p in GIT_BASH if os.path.isfile(p)), None)
 
 
+def _shell_env():
+    """Env for child shells. On Windows point TMPDIR/TEMP/TMP at a real temp dir:
+    Git Bash prints 'warning: could not find /tmp' (and tools that need a temp area
+    misbehave) when the temp area does not resolve to an existing folder."""
+    env = dict(os.environ)
+    if os.name == "nt":
+        tmp = os.environ.get("TEMP") or os.environ.get("TMP") or r"C:\Windows\Temp"
+        env["TMPDIR"] = tmp
+        env["TEMP"] = tmp
+        env["TMP"] = tmp
+    return env
+
+
 def _probe(entry: str) -> bool:
     """True when a canary echo through this shell entry comes back."""
     if entry == "bash":
@@ -397,7 +424,7 @@ def _probe(entry: str) -> bool:
         args, use_shell = "echo " + SHELL_PROBE, True
     try:
         p = subprocess.run(args, shell=use_shell, stdin=subprocess.DEVNULL, capture_output=True,
-                           text=True, errors="replace", timeout=20)
+                           text=True, errors="replace", timeout=20, env=_shell_env())
     except Exception:  # noqa: BLE001
         return False
     return SHELL_PROBE in (p.stdout or "")
@@ -458,7 +485,8 @@ def run_shell(command: str, cwd: str = None, timeout_s: int = 120):
     # stdin=DEVNULL: a command that reads stdin gets EOF instead of hanging (in RPC mode
     # stdin is the bridge's JSON pipe).
     p = subprocess.run(args, shell=use_shell, cwd=cwd, stdin=subprocess.DEVNULL,
-                       capture_output=True, text=True, errors="replace", timeout=timeout_s)
+                       capture_output=True, text=True, errors="replace", timeout=timeout_s,
+                       env=_shell_env())
     return {"exit_code": p.returncode,
             "stdout": p.stdout[-20000:], "stderr": with_shell_hint(p.returncode, p.stderr[-20000:])}
 
@@ -563,19 +591,37 @@ def agent_loop(task, *, system, model, tools, messages, max_steps=MAX_STEPS,
                    "system": system, "tools": tools, "messages": messages}
         apply_thinking(payload)
         _apply_cache_control(payload)
-        content, stop_reason, usage = call_model(key, payload, quiet=quiet)
+        try:
+            content, stop_reason, usage = call_model(key, payload, quiet=quiet)
+        except StaleSessionError:
+            # Saved history is stale: its thinking blocks are bound to an older system
+            # prompt/tools set. Drop the history and continue with just the task.
+            _emit("\n  [warn] saved history is stale (thinking blocks bound to a different "
+                  "conversation); continuing with just your current message")
+            # Keep exactly one message (the current task): a conversation must start with a
+            # single user message, so older user messages have to go with the history.
+            kept = [m for m in reversed(messages)
+                    if m.get("role") == "user" and isinstance(m.get("content"), str)]
+            messages[:] = [dict(kept[0])] if kept else [{"role": "user", "content": task}]
+            payload["messages"] = messages
+            content, stop_reason, usage = call_model(key, payload, quiet=quiet)
         _add_cost(cost, usage)
         messages.append({"role": "assistant", "content": content})
         tool_uses = [b for b in content if b.get("type") == "tool_use"]
         if not tool_uses and not _visible_text(content):
-            # Thinking-only response: nothing visible, nothing to execute. Recover
-            # by re-asking instead of returning an empty answer silently.
+            # Thinking-only response: nothing visible, nothing to execute. Recover by
+            # re-asking instead of returning an empty answer silently. Never hard-fail
+            # the run: if every attempt comes back empty, say so plainly and let the
+            # user steer the next step.
             if not recover_empty_turn(
                     lambda k, p: (*call_model(k, p, quiet=quiet), False),
-                    lambda t: _emit(t), key, payload, messages, cost):
-                _emit("\n  [error] model kept returning thinking-only responses "
-                      "(retried %d times); no visible output" % EMPTY_TURN_RETRIES)
-                return ""
+                    lambda t: _emit(t), key, payload, messages, cost,
+                    stop_reason=stop_reason):
+                note = ("Claude spent this turn thinking and produced no visible output after "
+                        "%d attempts. Nothing was lost. Give a shorter or more specific ask, or "
+                        "raise the token cap (-t) and retry." % EMPTY_TURN_RETRIES)
+                _emit("\n  [note] " + note)
+                return note
             content = messages[-1]["content"]
             tool_uses = [b for b in content if b.get("type") == "tool_use"]
             if not tool_uses:
@@ -1590,7 +1636,7 @@ def interruptible_shell(command, cwd, timeout_s):
     # stdin=DEVNULL: stdin here is the bridge's JSON pipe; a command must never read from it.
     p = subprocess.Popen(args, shell=use_shell, cwd=cwd, stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, errors="replace")
+                         text=True, errors="replace", env=_shell_env())
     bufs = {"out": [], "err": []}
     def drain(stream, key):
         try:
@@ -1736,6 +1782,8 @@ def call_model_rpc(key, payload, emit):
         if aborted:
             return content_finalize(blocks, order), stop_reason, usage, True
         detail = _http_error_detail(e)[:300]
+        if _looks_stale_session(detail):
+            raise StaleSessionError(detail) from e
         raise SystemExit(f"API error {e.code}" + (f": {detail}" if detail else ""))
     except Exception as e:  # noqa: BLE001
         if aborted:
@@ -1780,7 +1828,8 @@ def _visible_text(blocks) -> str:
 
 
 def recover_empty_turn(call_fn, emit_fn, key, payload, messages, cost,
-                       aborted_check=None, max_retries=EMPTY_TURN_RETRIES):
+                       aborted_check=None, max_retries=EMPTY_TURN_RETRIES,
+                       stop_reason=None):
     """Recover from a thinking-only response: a turn that carries a thinking block
     but no text and no tool call would, if returned, end the session silently -
     nothing shows in the app and the job just stops (observed on the 5.5 line with
@@ -1790,23 +1839,39 @@ def recover_empty_turn(call_fn, emit_fn, key, payload, messages, cost,
     the conversation without it (attempt 1 as is, later attempts with a nudge user
     message appended); a failed request is reported and the next attempt runs. On
     success, messages is rewritten in place to that conversation plus the nudge
-    (when used) and the new assistant reply. Returns True on success, False when
-    retries are exhausted or the run was aborted."""
-    nudge = ("Your previous response was empty (thinking only). Continue the task "
-             "now and produce visible output.")
+    (when used) and the new assistant reply.
+
+    stop_reason comes from the ORIGINAL thinking-only call. When it was
+    'max_tokens', the thinking used the whole output budget, so attempt 1 re-asks
+    with a raised max_tokens (4x, capped at 131072): a retry with the same budget
+    would just think it all away again. Returns True on success, False when
+    retries are exhausted or the run was aborted. Callers must treat False as a
+    graceful stop, never as a hard failure of the run."""
+    nudge = ("You produced only thinking with no visible output. Stop deliberating "
+             "and continue the task now: write your answer or make your next tool call.")
     base = [dict(m) for m in messages[:-1]]  # drop the thinking-only assistant tail
+    orig_budget = int(payload.get("max_tokens") or 0)
+    raised_budget = min(max(orig_budget * 4, 32768), 131072) if orig_budget else 0
     for attempt in range(1, max_retries + 1):
         if aborted_check is not None and aborted_check():
             return False
-        emit_fn("\n  [warn] thinking-only response (no visible output); retry %d/%d"
-                % (attempt, max_retries))
+        if attempt == 1 and stop_reason == "max_tokens" and raised_budget > orig_budget:
+            why = ("thinking used the whole output budget; raising max_tokens %d -> %d"
+                   % (orig_budget, raised_budget))
+        elif attempt == 1:
+            why = "thinking-only response (no visible output)"
+        else:
+            why = "nudging the model to produce visible output"
+        emit_fn("\n  [warn] %s; retry %d/%d" % (why, attempt, max_retries))
         nudged = attempt > 1
         req_payload = dict(payload)
+        if attempt == 1 and stop_reason == "max_tokens" and raised_budget > orig_budget:
+            req_payload["max_tokens"] = raised_budget
         req_payload["messages"] = base + (
             [{"role": "user", "content": nudge}] if nudged else [])
         try:
             blocks, _stop, usage, aborted = call_fn(key, req_payload)
-        except (SystemExit, urllib.error.HTTPError) as e:
+        except (SystemExit, urllib.error.HTTPError, StaleSessionError) as e:
             emit_fn("\n  [warn] retry %d/%d failed: %s" % (attempt, max_retries, str(e)[:300]))
             continue
         _add_cost(cost, usage)
@@ -1844,24 +1909,43 @@ def run_one_rpc(messages, msg, cost):
                    "system": system, "tools": tools, "messages": messages}
         apply_thinking(payload)
         _apply_cache_control(payload)
-        blocks, stop_reason, usage, aborted = call_model_rpc(key, payload, rpc_out)
+        try:
+            blocks, stop_reason, usage, aborted = call_model_rpc(key, payload, rpc_out)
+        except StaleSessionError:
+            if RPC["abort"].is_set():
+                return
+            # Saved session is stale: its thinking blocks are bound to an older system
+            # prompt/tools set. Drop the old history and continue with the current message.
+            rpc_note("\n  [warn] saved history is stale (thinking blocks bound to a different "
+                     "conversation); continuing with just your current message")
+            messages[:] = [messages[-1]]
+            payload["messages"] = messages
+            blocks, stop_reason, usage, aborted = call_model_rpc(key, payload, rpc_out)
         _add_cost(cost, usage)
         messages.append({"role": "assistant", "content": blocks})
         tool_uses = [b for b in blocks if b.get("type") == "tool_use"]
         if aborted:
             return
         if not tool_uses and not _visible_text(blocks):
-            # Thinking-only response: nothing visible, nothing to execute. A plain
-            # return here ends the turn silently - the job stops with no output
-            # (observed on the 5.5 line with adaptive thinking). Recover by
-            # re-asking; fail loudly if the model keeps doing it.
+            # Thinking-only response: nothing visible, nothing to execute (observed on
+            # the 5.5 line with adaptive thinking). Recover by re-asking. If every
+            # attempt comes back empty, do NOT hard-fail the run: replace the turn with
+            # a visible text note so the conversation stays well-formed and the user can
+            # simply send the next message ("continue") and the session picks up.
             if not recover_empty_turn(
                     lambda k, p: call_model_rpc(k, p, rpc_out),
                     lambda t: rpc_note(t), key, payload, messages, cost,
-                    aborted_check=lambda: RPC["abort"].is_set()):
-                rpc_err("run", "model kept returning thinking-only responses "
-                               "(retried %d times); turn aborted with no visible output"
-                        % EMPTY_TURN_RETRIES)
+                    aborted_check=lambda: RPC["abort"].is_set(),
+                    stop_reason=stop_reason):
+                if RPC["abort"].is_set():
+                    return
+                fallback = ("Claude spent this turn thinking and produced no visible output after "
+                            "%d attempts. The session is intact. Send your next message (for example "
+                            "'continue') and it will pick up where it left off." % EMPTY_TURN_RETRIES)
+                messages[-1] = {"role": "assistant",
+                                "content": [{"type": "text", "text": fallback}]}
+                rpc_out({"type": "message_update",
+                         "assistantMessageEvent": {"type": "text_delta", "delta": fallback}})
                 return
             blocks = messages[-1]["content"]
             tool_uses = [b for b in blocks if b.get("type") == "tool_use"]
