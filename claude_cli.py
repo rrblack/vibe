@@ -43,6 +43,11 @@ Sessions:
     (<cwd>/.claude_session.json). Switching workspaces switches conversations.
     /reset clears it; --fresh starts over without loading it.
 
+Shell (run_shell):
+    On Windows run_shell uses Git Bash when it works in this process tree, else cmd.exe
+    (decided once per process by a canary probe; see active_shell). VIBE_SHELL=bash|cmd
+    forces one. Elsewhere it uses /bin/sh.
+
 Built-in tools:
     run_shell, read_file, write_file, list_dir, http_request, get_current_datetime
     web_search      (Anthropic server-side live web search; toggle with /search or --no-search)
@@ -343,10 +348,101 @@ def expand_path(p: str) -> str:
     return os.path.abspath(os.path.join(STATE.get("cwd") or os.getcwd(), p))
 
 
+# ---------------- shell (run_shell) ----------------
+# On Windows run_shell has two possible entries:
+#   bash - Git Bash (bash.exe -c <command>): agents write POSIX shell most naturally.
+#   cmd  - cmd.exe (subprocess shell=True).
+# Something on this machine (most likely the AppControl driver) kills Git for Windows programs
+# when the parent chain is the vibe bridge: bash.exe exits 1 with no output, even for "echo".
+# Under other parents (e.g. Bionic) bash works. So the first time the tools are built, a canary
+# runs through bash: if it prints, the process uses bash, otherwise cmd.exe. The run_shell tool
+# description then tells the model which shell is active and its syntax.
+# VIBE_SHELL=bash|cmd skips the probe. Other platforms always use /bin/sh.
+GIT_BASH = (r"C:\Program Files\Git\usr\bin\bash.exe", r"C:\Program Files\Git\bin\bash.exe")
+SHELL_PROBE = "HR_SHELL_PROBE"
+
+SHELL_DESCRIPTIONS = {
+    "bash": ("Run a shell command with Git Bash (Windows); return exit_code, stdout, stderr. "
+             "Write POSIX/bash syntax (ls, cat, head, grep, pwd, &&, $VAR, 2>&1). "
+             "For builds, tests, installs, etc."),
+    "cmd": ("Run a command with Windows cmd.exe; return exit_code, stdout, stderr. Git Bash is NOT "
+            "available in this session, so write cmd syntax: dir, type, findstr, where, set, cd with "
+            "no argument to print the current folder, & or && to chain, %VAR% for variables. "
+            "There is no ls, cat, head, grep or pwd, and do not use 2>&1. For anything cmd cannot do, "
+            "use: powershell -NoProfile -Command \"...\". Git for Windows programs (git, bash) are "
+            "killed in this session: if you need one, tell the user instead of retrying."),
+    "sh": ("Run a shell command with /bin/sh; return exit_code, stdout, stderr. Write POSIX shell "
+           "syntax. For builds, tests, git, installs, etc."),
+}
+
+
+def _git_bash():
+    return next((p for p in GIT_BASH if os.path.isfile(p)), None)
+
+
+def _probe(entry: str) -> bool:
+    """True when a canary echo through this shell entry comes back."""
+    if entry == "bash":
+        args, use_shell = [_git_bash(), "-c", "echo " + SHELL_PROBE], False
+    else:
+        args, use_shell = "echo " + SHELL_PROBE, True
+    try:
+        p = subprocess.run(args, shell=use_shell, stdin=subprocess.DEVNULL, capture_output=True,
+                           text=True, errors="replace", timeout=20)
+    except Exception:  # noqa: BLE001
+        return False
+    return SHELL_PROBE in (p.stdout or "")
+
+
+def active_shell() -> str:
+    """'bash', 'cmd' or 'sh'. Decided once per process (probing on Windows), then remembered."""
+    if STATE.get("shell"):
+        return STATE["shell"]
+    forced = os.environ.get("VIBE_SHELL", "").strip().lower()
+    if os.name != "nt":
+        entry, why = "sh", "not Windows"
+    elif forced == "cmd" or (forced == "bash" and _git_bash()):
+        entry, why = forced, "VIBE_SHELL=" + forced
+    elif not _git_bash():
+        entry, why = "cmd", "Git Bash is not installed"
+    elif _probe("bash"):
+        entry, why = "bash", "Git Bash probe answered"
+    else:
+        entry = "cmd"
+        why = "Git Bash was killed (exit 1, no output) in this process tree"
+        if not _probe("cmd"):
+            why += "; the cmd.exe probe failed too"
+    STATE["shell"] = entry
+    msg = f"run_shell uses {entry} ({why})"
+    if STATE.get("rpc"):
+        rpc_note(msg)
+    else:
+        _emit("  [shell] " + msg)
+    return entry
+
+
+def _shell_args(command: str):
+    """(args, shell) for subprocess.run / Popen with the active shell entry."""
+    if active_shell() == "bash":
+        return [_git_bash(), "-c", command], False
+    return command, True  # cmd.exe on Windows, /bin/sh elsewhere
+
+
+def with_shell_description(tools):
+    """Copy of tools whose run_shell description names the active shell and its syntax."""
+    if not any(t.get("name") == "run_shell" for t in tools):
+        return tools
+    desc = SHELL_DESCRIPTIONS[active_shell()]
+    return [dict(t, description=desc) if t.get("name") == "run_shell" else t for t in tools]
+
+
 def run_shell(command: str, cwd: str = None, timeout_s: int = 120):
     cwd = cwd or STATE.get("cwd") or os.getcwd()
-    p = subprocess.run(command, shell=True, cwd=cwd, capture_output=True,
-                       text=True, timeout=timeout_s)
+    args, use_shell = _shell_args(command)
+    # stdin=DEVNULL: a command that reads stdin gets EOF instead of hanging (in RPC mode
+    # stdin is the bridge's JSON pipe).
+    p = subprocess.run(args, shell=use_shell, cwd=cwd, stdin=subprocess.DEVNULL,
+                       capture_output=True, text=True, errors="replace", timeout=timeout_s)
     return {"exit_code": p.returncode,
             "stdout": p.stdout[-20000:], "stderr": p.stderr[-20000:]}
 
@@ -541,7 +637,7 @@ SUBAGENTS = {
 
 def subagent_tools(names):
     names = set(names) - {"spawn_subagent"}
-    tools = [t for t in TOOLS if t["name"] in names]
+    tools = with_shell_description([t for t in TOOLS if t["name"] in names])
     if "web_search" in names:
         tools = tools + [WEB_SEARCH_TOOL]
     return tools
@@ -574,7 +670,8 @@ TOOL_IMPL = {
 
 TOOLS = [
     {"name": "run_shell",
-     "description": "Run a shell command via the system shell; return exit_code, stdout, stderr. For builds, tests, git, installs, etc.",
+     # Replaced per process by with_shell_description() with the active shell (bash / cmd / sh).
+     "description": "Run a shell command; return exit_code, stdout, stderr. For builds, tests, git, installs, etc.",
      "input_schema": {"type": "object", "properties": {
         "command": {"type": "string", "description": "The command line to run."},
         "cwd": {"type": "string", "description": "Optional working directory."},
@@ -617,7 +714,7 @@ WEB_SEARCH_TOOL = {"type": "web_search_20250305", "name": "web_search", "max_use
 
 
 def main_tools():
-    tools = list(TOOLS)
+    tools = with_shell_description(TOOLS)
     if STATE.get("web_search", True):
         tools = tools + [WEB_SEARCH_TOOL]
     return tools
@@ -1454,8 +1551,11 @@ def ask_user(title, message, options, allow_all=False):
 
 def interruptible_shell(command, cwd, timeout_s):
     """Run a shell command, killing it if the run is aborted or the timeout hits."""
-    p = subprocess.Popen(command, shell=True, cwd=cwd, stdout=subprocess.PIPE,
-                         stderr=subprocess.PIPE, text=True)
+    args, use_shell = _shell_args(command)
+    # stdin=DEVNULL: stdin here is the bridge's JSON pipe; a command must never read from it.
+    p = subprocess.Popen(args, shell=use_shell, cwd=cwd, stdin=subprocess.DEVNULL,
+                         stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                         text=True, errors="replace")
     bufs = {"out": [], "err": []}
     def drain(stream, key):
         try:
@@ -1496,7 +1596,10 @@ def execute_tool(name, args):
     if name == "run_shell":
         cwd = args.get("cwd") or STATE.get("cwd") or os.getcwd()
         timeout_s = int(args.get("timeout_s", 120) or 120)
-        r = interruptible_shell(args.get("command", ""), cwd, timeout_s)
+        try:
+            r = interruptible_shell(args.get("command", ""), cwd, timeout_s)
+        except Exception as e:  # noqa: BLE001  (e.g. a cwd that does not exist): report it, keep the turn going
+            return to_text({"error": repr(e)}), True
         return to_text(r), (r["exit_code"] != 0)
     fn = TOOL_IMPL.get(name)
     if fn is None:
