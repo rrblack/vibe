@@ -37,12 +37,12 @@ node delegate.mjs start --cwd "<folder Claude works in>" --prompt-file "<prompt.
 
 ```
 node delegate.mjs wait <id>          # blocks up to 100 s, prints what is new
-   exit 0 DONE | 3 RUNNING (call wait again) | 4 KILLED (idle) | 5 WAITING (question, answer in the app) | 1 error
+   exit 0 for DONE / RUNNING / WAITING / KILLED (act on the printed state line: RUNNING = call wait again) | 1 = hard error
 ```
 
    `wait` has one job: detect the end of the turn. Call it a few times at
    most per turn, not as a watcher (the live pane or the phone app is the
-   watcher). Stop waiting only on 0, 4 or 5 (or 1 = error, report it).
+   watcher). Stop waiting only when the state line says DONE, WAITING or KILLED (exit 1 = hard error, report it).
 
 5. Collect the answer:
 

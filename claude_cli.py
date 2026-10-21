@@ -301,13 +301,44 @@ def _read_message_stream(req, blocks: dict, order: list, usage: dict, seen: dict
     return stop_reason
 
 
+def _clean_surrogates(value):
+    """Replace lone UTF-16 surrogates with U+FFFD, preserving valid high+low pairs.
+
+    A lone surrogate serializes (ensure_ascii) to a lone \\uXXXX hex escape that the
+    Anthropic API rejects ('lone leading surrogate in hex escape'). Applied to the
+    whole payload right before json.dumps in call_model, so it is idempotent and
+    safe at the request boundary.
+    """
+    if isinstance(value, str):
+        out = []
+        i, n = 0, len(value)
+        while i < n:
+            cp = ord(value[i])
+            if 0xD800 <= cp <= 0xDBFF and i + 1 < n and 0xDC00 <= ord(value[i + 1]) <= 0xDFFF:
+                out.append(value[i:i + 2])
+                i += 2
+                continue
+            if 0xD800 <= cp <= 0xDFFF:
+                out.append("\uFFFD")
+            else:
+                out.append(value[i])
+            i += 1
+        return "".join(out)
+    if isinstance(value, dict):
+        return {(_clean_surrogates(k) if isinstance(k, str) else k): _clean_surrogates(v)
+                for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_clean_surrogates(v) for v in value]
+    return value
+
+
 def call_model(key: str, payload: dict, quiet: bool = False):
     """Stream a Messages API call. Returns (content_blocks, stop_reason, usage)."""
     payload = dict(payload)
     payload["stream"] = True
     req = urllib.request.Request(
         API_BASE + "/v1/messages",
-        data=json.dumps(payload).encode("utf-8"),
+        data=json.dumps(_clean_surrogates(payload)).encode("utf-8"),
         headers={"x-api-key": key, "anthropic-version": "2023-06-01",
                  "content-type": "application/json", "accept": "text/event-stream"},
         method="POST",
@@ -1697,7 +1728,7 @@ def call_model_rpc(key, payload, emit):
     payload["stream"] = True
     req = urllib.request.Request(
         API_BASE + "/v1/messages",
-        data=json.dumps(payload).encode("utf-8"),
+        data=json.dumps(_clean_surrogates(payload)).encode("utf-8"),
         headers={"x-api-key": key, "anthropic-version": "2023-06-01",
                  "content-type": "application/json", "accept": "text/event-stream"},
         method="POST")
@@ -2156,9 +2187,9 @@ JSON_REFUSAL = f"""
         [--model haiku|sonnet|opus|fable] [--effort low|medium|high] --title "<t>"
        -> SESSION <id>
    node delegate.mjs wait <id>       blocks up to 100 s, prints what is new
-       exit 0 DONE | 3 RUNNING (call wait again) | 4 KILLED (idle 300 s)
-            | 5 WAITING (question, answer in the app) | 1 error
-       keep calling wait while it exits 3 (there is NO total time cap)
+       exits 0 for every normal state; the printed state line is the signal:
+       DONE | RUNNING (call wait again) | WAITING (answer in the app) | KILLED (idle stop)
+       only a hard error exits non-zero (1). No total time cap.
    node delegate.mjs result <id>     final reply of the last turn
    node delegate.mjs send <id> --prompt "<follow-up>"   next turn, same session
    node delegate.mjs stop <id>

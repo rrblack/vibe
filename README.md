@@ -98,7 +98,7 @@ Transient Anthropic API errors (HTTP 408/425/429/500/502/503/504/529, dropped co
 
 ## Bionic skill (SKILL.md)
 
-`SKILL.md` at the repo root is a Bionic/Claude skill that teaches a local agent how to delegate work to Claude. It teaches **only** the live `delegate.mjs` session path (start with `--cwd` / `--prompt-file` / `--model` / `--effort`, keep calling `wait` while it exits 3 and relay progress, then `result`; `send` for follow-ups, `stop`), model guidance (haiku quick, sonnet normal, opus + high for hard jobs), the 300 s idle watchdog with no total cap, and that `--json` is blocked by the harness. Install by copying it into a skills folder (e.g. `~/.lmstudio/skills/vibe/`); keep both copies identical.
+`SKILL.md` at the repo root is a Bionic/Claude skill that teaches a local agent how to delegate work to Claude. It teaches **only** the live `delegate.mjs` session path (start with `--cwd` / `--prompt-file` / `--model` / `--effort`, keep calling `wait` (it exits 0) until the state line says DONE, and relay progress, then `result`; `send` for follow-ups, `stop`), model guidance (haiku quick, sonnet normal, opus + high for hard jobs), the 300 s idle watchdog with no total cap, and that `--json` is blocked by the harness. Install by copying it into a skills folder (e.g. `~/.lmstudio/skills/vibe/`); keep both copies identical.
 
 The visible, live delegation path used by the phone app and the bridge is `delegate.mjs` in [harness-remote](https://github.com/rrblack/harness-remote) (README section *Delegating to Claude from Bionic*).
 
