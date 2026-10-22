@@ -434,28 +434,53 @@ def _git_bash():
     return next((p for p in GIT_BASH if os.path.isfile(p)), None)
 
 
-def _shell_env():
+def _git_bin_dirs():
+    """Existing Git for Windows bin dirs (usr\\bin, bin, mingw64\\bin), [] without Git.
+    The root is the Git install folder whether bash.exe lives in <root>\\bin or <root>\\usr\\bin."""
+    bash = _git_bash()
+    if not bash:
+        return []
+    root = os.path.dirname(os.path.dirname(bash))
+    if os.path.basename(root).lower() == "usr":
+        root = os.path.dirname(root)
+    dirs = [os.path.join(root, "usr", "bin"), os.path.join(root, "bin"),
+            os.path.join(root, "mingw64", "bin")]
+    return [d for d in dirs if os.path.isdir(d)]
+
+
+def _shell_env(bash: bool = False):
     """Env for child shells. On Windows point TMPDIR/TEMP/TMP at a real temp dir:
     Git Bash prints 'warning: could not find /tmp' (and tools that need a temp area
-    misbehave) when the temp area does not resolve to an existing folder."""
+    misbehave) when the temp area does not resolve to an existing folder.
+    With bash=True, also put Git's bin dirs at the front of PATH: a parent (e.g. the
+    bridge) may not have them, and then grep/sed/head/cat are 'command not found'.
+    Never for cmd.exe: GNU find/sort/diff in usr\\bin would shadow the Windows ones."""
     env = dict(os.environ)
     if os.name == "nt":
         tmp = os.environ.get("TEMP") or os.environ.get("TMP") or r"C:\Windows\Temp"
         env["TMPDIR"] = tmp
         env["TEMP"] = tmp
         env["TMP"] = tmp
+        if bash:
+            parts = env.get("PATH", "").split(os.pathsep)
+            have = {p.lower() for p in parts if p}
+            front = [d for d in _git_bin_dirs() if d.lower() not in have]
+            if front:
+                env["PATH"] = os.pathsep.join(front + parts)
     return env
 
 
 def _probe(entry: str) -> bool:
     """True when a canary echo through this shell entry comes back."""
     if entry == "bash":
-        args, use_shell = [_git_bash(), "-c", "echo " + SHELL_PROBE], False
+        args, use_shell = [_git_bash(), "-c", "command -v grep >/dev/null 2>&1 && echo " + SHELL_PROBE], False
+        env = _shell_env(bash=True)
     else:
         args, use_shell = "echo " + SHELL_PROBE, True
+        env = _shell_env()
     try:
         p = subprocess.run(args, shell=use_shell, stdin=subprocess.DEVNULL, capture_output=True,
-                           text=True, errors="replace", timeout=20, env=_shell_env())
+                           text=True, errors="replace", timeout=20, env=env)
     except Exception:  # noqa: BLE001
         return False
     return SHELL_PROBE in (p.stdout or "")
@@ -517,7 +542,7 @@ def run_shell(command: str, cwd: str = None, timeout_s: int = 120):
     # stdin is the bridge's JSON pipe).
     p = subprocess.run(args, shell=use_shell, cwd=cwd, stdin=subprocess.DEVNULL,
                        capture_output=True, text=True, errors="replace", timeout=timeout_s,
-                       env=_shell_env())
+                       env=_shell_env(bash=active_shell() == "bash"))
     return {"exit_code": p.returncode,
             "stdout": p.stdout[-20000:], "stderr": with_shell_hint(p.returncode, p.stderr[-20000:])}
 
@@ -1667,7 +1692,7 @@ def interruptible_shell(command, cwd, timeout_s):
     # stdin=DEVNULL: stdin here is the bridge's JSON pipe; a command must never read from it.
     p = subprocess.Popen(args, shell=use_shell, cwd=cwd, stdin=subprocess.DEVNULL,
                          stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                         text=True, errors="replace", env=_shell_env())
+                         text=True, errors="replace", env=_shell_env(bash=active_shell() == "bash"))
     bufs = {"out": [], "err": []}
     def drain(stream, key):
         try:
